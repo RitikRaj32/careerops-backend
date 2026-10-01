@@ -1,0 +1,82 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./.data/dev.db"
+}
+
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  phone         String?  @unique
+  name          String?  // Kept for backward compatibility
+  firstName     String?
+  lastName      String?
+  contactNumber String?
+  gender        String?
+  currentCity   String?
+  collegeName   String?
+  course        String?
+  branch        String?
+  collegeYear   String?
+  skillsList    String?
+  isOnboarded   Boolean  @default(false)
+  
+  role          String   @default("CANDIDATE")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // Profile
+  resumeUrl     String?
+  resumeScore   Int?
+  skills        Skill[]
+  applications  Application[]
+  mockInterviews MockInterview[]
+}
+
+
+
+model Job {
+  id          String   @id @default(uuid())
+  title       String
+  company     String
+  description String
+  requirements String
+  postedAt    DateTime @default(now())
+  
+  applications Application[]
+}
+
+model Application {
+  id        String   @id @default(uuid())
+  userId    String
+  jobId     String
+  status    String   @default("APPLIED")
+  appliedAt DateTime @default(now())
+  
+  user      User     @relation(fields: [userId], references: [id])
+  job       Job      @relation(fields: [jobId], references: [id])
+}
+
+
+
+model Skill {
+  id     String @id @default(uuid())
+  name   String @unique
+  users  User[]
+}
+
+model MockInterview {
+  id        String   @id @default(uuid())
+  userId    String
+  score     Int?
+  feedback  String?
+  createdAt DateTime @default(now())
+  
+  user      User     @relation(fields: [userId], references: [id])
+}
