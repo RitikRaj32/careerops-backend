@@ -868,6 +868,10 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message || 'Internal Server Error' });
 });
 
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
-});
+if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`Server is running on port ${port}`);
+  });
+}
+
+module.exports = app;
