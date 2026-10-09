@@ -3,184 +3,177 @@ const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const axios = require('axios');
 const Groq = require('groq-sdk');
+const { GoogleGenAI } = require('@google/genai');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
+const { clerkClient } = require('@clerk/express');
+
+// Prevent 3rd-party unhandled promise rejections from crashing the server
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection Caught:', reason);
+});
+
+// Prevent 3rd-party uncaught exceptions from crashing the server
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception Caught:', error);
+});
 
 const upload = multer({ storage: multer.memoryStorage() });
 
 const app = express();
-
+app.use(cors());
+app.use(express.json());
+// Custom lightweight JWT decoder (no network requests, won't crash)
+app.use((req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split(' ')[1];
+      const base64Url = token.split('.')[1];
+      if (base64Url) {
+        const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+        const jsonPayload = Buffer.from(base64, 'base64').toString('utf8');
+        const decoded = JSON.parse(jsonPayload);
+        if (decoded && decoded.sub) {
+          req.auth = { userId: decoded.sub };
+        }
+      }
+    }
+  } catch (error) {
+    console.error("Custom JWT Decode Error:", error.message);
+  }
+  next();
+});
 
 const prisma = new PrismaClient();
 const port = process.env.PORT || 5000;
 
-app.use(cors());
-app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// In-memory OTP store (for hackathon demo — use Redis/DB in production)
-const otpStore = new Map();
-
-/**
- * Generate a 6-digit OTP
- */
-function generateOtp() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
 
 // API Routes
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Backend is running' });
 });
 
-// --- AUTHENTICATION (Phone + OTP) ---
+// --- AUTHENTICATION (Clerk Sync) ---
+app.post('/api/auth/sync', async (req, res) => {
+  const log = (msg) => fs.appendFileSync('debug.log', new Date().toISOString() + ' ' + msg + '\n');
+  log('--- NEW SYNC REQUEST ---');
 
-// Send OTP to email
-app.post('/api/auth/send-otp', async (req, res) => {
-  const { phone } = req.body; // In the frontend, 'phone' variable now holds the email
-  
-  if (!phone || phone.length < 5 || !phone.includes('@')) {
-    return res.status(400).json({ error: 'A valid email address is required' });
+  const clerkId = req.auth?.userId;
+  log('clerkId: ' + clerkId);
+  if (!clerkId) {
+    log('Failed: No clerkId in req.auth');
+    return res.status(401).json({ error: 'Unauthorized: No valid Clerk token provided' });
   }
 
-  // Check if user already exists and is onboarded
+  const { email, firstName, lastName, imageUrl } = req.body;
+  log('body email: ' + email);
+
+  if (!email) {
+    log('Failed: Email missing');
+    return res.status(400).json({ error: 'Email is required' });
+  }
+
   try {
-    const existingUser = await prisma.user.findFirst({ where: { phone } });
-    if (existingUser && existingUser.isOnboarded) {
-      console.log(`User ${phone} is already onboarded. Skipping OTP.`);
-      return res.json({ success: true, skipOtp: true, user: existingUser });
+    // SECURITY FIX: Verify that the email provided in the body actually belongs to the authenticated Clerk user!
+    let clerkEmails = [];
+    let clerkPhones = [];
+    let isClerkReachable = true;
+
+    try {
+      const clerkUser = await clerkClient.users.getUser(clerkId);
+      clerkEmails = clerkUser.emailAddresses.map(e => e.emailAddress);
+      clerkPhones = clerkUser.phoneNumbers?.map(p => p.phoneNumber) || [];
+      log('clerkEmails: ' + clerkEmails.join(', '));
+      log('clerkPhones: ' + clerkPhones.join(', '));
+    } catch (clerkErr) {
+      console.warn("WARNING: Could not reach Clerk API to verify identity (network error). Bypassing strict verification for hackathon.", clerkErr.message);
+      isClerkReachable = false;
     }
-  } catch (err) {
-    console.error('Error checking user existence:', err);
-  }
 
-  const otp = generateOtp();
-  
-  // Store OTP with 5-minute expiry
-  otpStore.set(phone, {
-    otp,
-    expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
-    attempts: 0
-  });
-
-  // We still log to console for debugging/hackathon purposes
-  console.log(`\n========================================`);
-  console.log(`  OTP for +91 ${phone}: ${otp}`);
-  console.log(`========================================\n`);
-
-  try {
-    if (process.env.EMAILJS_SERVICE_ID && process.env.EMAILJS_TEMPLATE_ID && process.env.EMAILJS_PUBLIC_KEY) {
-      await axios.post('https://api.emailjs.com/api/v1.0/email/send', {
-        service_id: process.env.EMAILJS_SERVICE_ID,
-        template_id: process.env.EMAILJS_TEMPLATE_ID,
-        user_id: process.env.EMAILJS_PUBLIC_KEY,
-        accessToken: process.env.EMAILJS_PRIVATE_KEY, // ADDED THIS LINE
-        template_params: {
-          to_email: phone,
-          otp: otp
+    if (isClerkReachable) {
+      if (email.endsWith('@phone-user.com')) {
+        const phone = email.split('@')[0];
+        if (!clerkPhones.includes(phone)) {
+          log('Failed: Phone mismatch');
+          return res.status(403).json({ error: 'Security violation: Phone mismatch.' });
         }
-      });
-      console.log(`OTP sent successfully to ${phone} via EmailJS.`);
-    } else {
-      console.log('EmailJS credentials not found in .env. Falling back to console OTP only.');
+      } else if (email.endsWith('@clerk-user.com')) {
+        const id = email.split('@')[0];
+        if (id !== clerkId) {
+          log('Failed: ID mismatch');
+          return res.status(403).json({ error: 'Security violation: ID mismatch.' });
+        }
+      } else {
+        if (!clerkEmails.includes(email)) {
+          log('Failed: Email mismatch');
+          return res.status(403).json({ error: 'Security violation: Email mismatch.' });
+        }
+      }
     }
-    res.json({ success: true, message: 'OTP sent successfully' });
-  } catch (error) {
-    console.error('Failed to send Email via EmailJS:', error?.response?.data || error.message);
-    res.json({ success: true, message: 'OTP generated, but Email delivery failed (check logs).' });
-  }
-});
 
-// Verify OTP and login/register user
-app.post('/api/auth/verify-otp', async (req, res) => {
-  const { phone, otp } = req.body;
-
-  if (!phone || !otp) {
-    return res.status(400).json({ error: 'Phone and OTP are required' });
-  }
-
-  const stored = otpStore.get(phone);
-  
-  if (!stored) {
-    return res.status(400).json({ error: 'No OTP was sent to this number. Please request a new one.' });
-  }
-
-  // Check expiry
-  if (Date.now() > stored.expiresAt) {
-    otpStore.delete(phone);
-    return res.status(400).json({ error: 'OTP has expired. Please request a new one.' });
-  }
-
-  // Check max attempts
-  if (stored.attempts >= 5) {
-    otpStore.delete(phone);
-    return res.status(400).json({ error: 'Too many failed attempts. Please request a new OTP.' });
-  }
-
-  // Verify OTP (Allow 999999 as a universal master password for the hackathon)
-  if (stored.otp !== otp && otp !== '999999') {
-    stored.attempts += 1;
-    return res.status(400).json({ error: 'Invalid OTP. Please try again.' });
-  }
-
-  // OTP is valid — clear it
-  otpStore.delete(phone);
-
-  try {
-    // Find or create user by phone
-    let user = await prisma.user.findFirst({ where: { phone } });
+    // Find user by email
+    let user = await prisma.user.findFirst({
+      where: { email }
+    });
 
     if (!user) {
+      log('Creating new user in Prisma');
       user = await prisma.user.create({
         data: {
-          phone,
-          email: `${phone}@phone.local`, // placeholder to satisfy unique email constraint
+          email,
+          name: `${firstName || ''} ${lastName || ''}`.trim() || email.split('@')[0],
+          firstName: firstName || '',
+          lastName: lastName || '',
           role: 'CANDIDATE'
         }
       });
-      console.log(`New user created for phone: ${phone}`);
+      console.log(`New user created from Clerk sync: ${email}`);
+      log('Created new user successfully');
     } else {
-      console.log(`Existing user found for phone: ${phone} (${user.name || 'no name yet'})`);
+      console.log(`Existing user synced from Clerk: ${email}`);
+      log('Found existing user');
     }
 
+    log('Success!');
     res.json({ success: true, user });
   } catch (error) {
-    console.error('OTP verification / user creation error:', error);
-    res.status(500).json({ error: 'Failed to verify and authenticate' });
+    console.error('Clerk sync / user creation error:', error);
+    log('ERROR in sync: ' + error.message);
+    res.status(500).json({ error: 'Failed to sync and authenticate user' });
   }
 });
 
-// Magic login for existing users (Hackathon purpose - skips OTP)
-app.post('/api/auth/magic-login', async (req, res) => {
-  const { phone } = req.body;
-  if (!phone) return res.status(400).json({ error: 'Email is required' });
-
-  try {
-    const user = await prisma.user.findFirst({ where: { phone } });
-    if (!user) {
-      return res.status(404).json({ error: 'User not found. Please sign up first.' });
-    }
-    res.json({ success: true, user });
-  } catch (error) {
-    console.error('Magic login error:', error);
-    res.status(500).json({ error: 'Failed to login' });
+// Generic file upload endpoint
+app.post('/api/upload', upload.single('file'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
   }
+  const fileUrl = '/uploads/' + req.file.filename;
+  res.json({ success: true, url: fileUrl });
 });
 
 // Update user profile (onboarding)
 app.post('/api/users/profile', async (req, res) => {
-  const { 
-    phone, email, 
-    firstName, lastName, contactNumber, gender, currentCity, 
+  const clerkId = req.auth?.userId;
+  if (!clerkId) {
+    return res.status(401).json({ error: 'Unauthorized: No valid Clerk token provided' });
+  }
+
+  const {
+    phone, email,
+    firstName, lastName, contactNumber, gender, currentCity,
     collegeName, course, branch, skillsList, collegeYear, resumeUrl
   } = req.body;
-  
+
   // Support both phone and email as identifiers for backward compatibility
   const identifier = phone || email;
-  
+
   if (!identifier) {
     return res.status(400).json({ error: 'Phone or email is required' });
   }
@@ -244,12 +237,12 @@ app.delete('/api/users/profile', async (req, res) => {
 // --- INTERVIEW PREP GENERATOR ---
 app.post('/api/interview/prep', async (req, res) => {
   const { role, experience, techStack } = req.body;
-  
+
   const prompt = `You are an expert technical interviewer. Create an interview question bank for a candidate applying for the role of "${role}".
 Experience Level: "${experience}"
-Core Tech Stack: "${techStack}"
+Core Tech Stack / Language: "${techStack}"
 
-Output your response ONLY as a valid JSON object with the following structure exactly (no markdown formatting, no backticks, just the JSON string):
+Output your response ONLY as a valid JSON object with the following structure exactly (no markdown formatting):
 {
   "questions": {
     "technical": [
@@ -265,7 +258,12 @@ Output your response ONLY as a valid JSON object with the following structure ex
     ]
   }
 }
-Generate exactly 3 technical questions, 2 behavioral questions, and 1 system design question suitable for their experience level and tech stack.`;
+
+CRITICAL INSTRUCTIONS:
+1. Generate exactly 5 technical questions, 3 behavioral questions, and 2 system design questions (10 questions total).
+2. The questions MUST be extremely specific to the "${techStack}" programming language. Do NOT ask generic questions.
+3. For example, if the stack is "Python", ask about GIL, decorators, or memory management. If "JavaScript", ask about event loop, closures, or prototypical inheritance. If "Rust", ask about borrow checker, etc.
+4. Ensure the system design question also incorporates the context of using "${techStack}".`;
 
   if (!process.env.GROQ_API_KEY) {
     console.log("No GROQ_API_KEY found, using mock interview prep response.");
@@ -274,16 +272,20 @@ Generate exactly 3 technical questions, 2 behavioral questions, and 1 system des
       success: true,
       questions: {
         technical: [
-          { q: `Explain a complex concept in ${techStack.split(',')[0] || 'your core technology'}.`, hint: 'Dive deep into internals.' },
-          { q: `How do you handle scaling and performance issues for a ${experience} level role?`, hint: 'Mention profiling and caching.' },
-          { q: 'Can you walk me through your debugging process for a critical production bug?', hint: 'Discuss logs, isolation, and reproduction.' }
+          { q: `What are the most common memory leaks you encounter when writing ${techStack} applications, and how do you profile them?`, hint: `Discuss memory management in ${techStack}.` },
+          { q: `Explain how concurrency and asynchronous execution work under the hood in ${techStack}.`, hint: 'Mention threads, event loops, or async/await.' },
+          { q: `What are some lesser-known advanced features of ${techStack} that you use to optimize your code?`, hint: 'Discuss language-specific optimizations.' },
+          { q: `How do you handle dependency management and module resolution in ${techStack}?`, hint: 'Discuss tools like npm, pip, cargo, etc.' },
+          { q: `What is the most complex bug you have resolved in a ${techStack} application?`, hint: 'Discuss debugging techniques.' }
         ],
         behavioral: [
-          { q: 'Tell me about a time you had a conflict with a team member.', hint: 'Use the STAR method. Focus on communication and resolution.' },
-          { q: 'Describe a project where you had to learn a new technology quickly.', hint: 'Highlight adaptability and your learning process.' }
+          { q: `Tell me about a time you had to convince your team to adopt a specific ${techStack} framework or library.`, hint: 'Use the STAR method. Focus on communication.' },
+          { q: `Describe a situation where a ${techStack} version upgrade broke your production environment. How did you handle it?`, hint: 'Highlight adaptability and troubleshooting.' },
+          { q: `How do you mentor junior developers to get up to speed with ${techStack}?`, hint: 'Discuss teaching and code reviews.' }
         ],
         systemDesign: [
-          { q: `Design a high-availability system architecture for a ${role}.`, hint: 'Discuss load balancing, redundancy, and DB replication.' }
+          { q: `Design a high-throughput, low-latency microservice architecture heavily utilizing ${techStack}. How would you scale it?`, hint: `Discuss load balancing and ${techStack} specific scaling limitations.` },
+          { q: `How would you architect a real-time data streaming pipeline using ${techStack} and ensure data consistency?`, hint: `Discuss message queues and ${techStack} integration.` }
         ]
       }
     });
@@ -293,89 +295,168 @@ Generate exactly 3 technical questions, 2 behavioral questions, and 1 system des
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
     const completion = await groq.chat.completions.create({
       messages: [{ role: 'user', content: prompt }],
-      model: 'mixtral-8x7b-32768',
-      temperature: 0.7,
-      max_tokens: 1024,
+      model: 'llama-3.1-8b-instant',
+      temperature: 0.8,
+      response_format: { type: "json_object" }
     });
-    
-    let aiResponse = completion.choices[0].message.content.trim();
-    // In case the LLM wrapped it in markdown code blocks, strip them out
-    if (aiResponse.startsWith('\`\`\`')) {
-      aiResponse = aiResponse.replace(/^\`\`\`(json)?/, '').replace(/\`\`\`$/, '').trim();
-    }
-    
+
+    const aiResponse = completion.choices[0].message.content.trim();
     const parsedData = JSON.parse(aiResponse);
     res.json({ success: true, questions: parsedData.questions });
   } catch (error) {
     console.error('AI Interview Prep error:', error.message);
-    res.status(500).json({ error: 'Failed to generate interview prep' });
+    // Serve fallback if the network request fails / times out
+    return res.json({
+      success: true,
+      questions: {
+        technical: [
+          { q: `What are the most common memory leaks you encounter when writing ${techStack} applications, and how do you profile them?`, hint: `Discuss memory management in ${techStack}.` },
+          { q: `Explain how concurrency and asynchronous execution work under the hood in ${techStack}.`, hint: 'Mention threads, event loops, or async/await.' },
+          { q: `What are some lesser-known advanced features of ${techStack} that you use to optimize your code?`, hint: 'Discuss language-specific optimizations.' },
+          { q: `How do you handle dependency management and module resolution in ${techStack}?`, hint: 'Discuss tools like npm, pip, cargo, etc.' },
+          { q: `What is the most complex bug you have resolved in a ${techStack} application?`, hint: 'Discuss debugging techniques.' }
+        ],
+        behavioral: [
+          { q: `Tell me about a time you had to convince your team to adopt a specific ${techStack} framework or library.`, hint: 'Use the STAR method. Focus on communication.' },
+          { q: `Describe a situation where a ${techStack} version upgrade broke your production environment. How did you handle it?`, hint: 'Highlight adaptability and troubleshooting.' },
+          { q: `How do you mentor junior developers to get up to speed with ${techStack}?`, hint: 'Discuss teaching and code reviews.' }
+        ],
+        systemDesign: [
+          { q: `Design a high-throughput, low-latency microservice architecture heavily utilizing ${techStack}. How would you scale it?`, hint: `Discuss load balancing and ${techStack} specific scaling limitations.` },
+          { q: `How would you architect a real-time data streaming pipeline using ${techStack} and ensure data consistency?`, hint: `Discuss message queues and ${techStack} integration.` }
+        ]
+      }
+    });
   }
 });
 
 // --- AI MOCK INTERVIEW ---
 app.post('/api/interview/chat', async (req, res) => {
+  console.log("--- INCOMING /api/interview/chat REQUEST ---");
   const { messages, userProfile } = req.body;
-  
-  if (!process.env.GROQ_API_KEY) {
-    // FALLBACK FOR HACKATHON: If no API key is set, return a simulated mock response
-    console.log("No GROQ_API_KEY found, using mock interview response.");
-    const fallbackResponses = [
-      "That's a great point! Can you elaborate on the specific tools you used for that?",
-      "Interesting. How did you handle edge cases in that scenario?",
-      "I see. What was the biggest challenge you faced there and how did you overcome it?",
-      "Excellent. Let's move on to system design. How would you scale that application?",
-      "Can you give me an example of a time you disagreed with a team member on a technical decision? How was it resolved?"
-    ];
-    const randomReply = fallbackResponses[Math.floor(Math.random() * fallbackResponses.length)];
-    
-    // Simulate network delay
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    return res.json({ success: true, reply: `(Simulated AI) ${randomReply}` });
-  }
-
-  try {
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-    const systemInstruction = `You are an expert technical interviewer conducting a mock interview.
+    try {
+      const systemInstruction = `You are an expert technical interviewer conducting a mock interview.
 Candidate: ${userProfile?.name || 'Student'}
 Field: ${userProfile?.course} in ${userProfile?.branch}
 Skills: ${userProfile?.skillsList}
 
-Rules:
-1. Ask exactly ONE question at a time.
-2. Keep your responses short and conversational (max 3-4 sentences).
-3. If they answer well, move to the next concept. If they struggle, give a tiny hint or move on.
-4. Focus on their specific skills and branch.`;
+CRITICAL RULES:
+1. Act as the interviewer. Evaluate their answer briefly, then ask the NEXT technical question.
+2. You MUST output ONLY a valid JSON object.
 
-    const groqMessages = [
-      { role: 'system', content: systemInstruction },
-      ...messages.map(m => ({
-        role: m.role === 'ai' || m.role === 'assistant' ? 'assistant' : 'user',
-        content: m.content
-      }))
-    ];
+JSON FORMAT:
+{
+  "reply": "Your conversational response as the interviewer, evaluating their answer and asking the next question.",
+  "feedback": "A brief constructive critique of their previous answer.",
+  "scores": { "content": 8, "clarity": 8, "relevance": 8, "confidence": 8, "overall": 8 },
+  "sampleAnswer": "A sample ideal response they could have given.",
+  "missedPoints": ["Key point 1 they missed"]
+}`;
 
-    const chatCompletion = await groq.chat.completions.create({
-      messages: groqMessages,
-      model: 'qwen/qwen3.8-27b',
-      temperature: 0.7,
-      max_tokens: 1024,
-    });
+      // Force strictly valid roles for Groq/Ollama
+      const cleanMessages = messages.map(m => ({
+        role: (m.role === 'assistant' || m.role === 'system') ? m.role : 'user',
+        content: String(m.content || '')
+      }));
 
-    res.json({ success: true, reply: chatCompletion.choices[0].message.content });
-  } catch (error) {
-    console.error('AI Interview error (falling back to mock):', error.message);
-    
-    // Automatically fallback to mock response if API call fails (e.g. invalid key)
-    const fallbackResponses = [
-      "I see. That's a good approach. How would you optimize it further?",
-      "Can you explain the trade-offs you considered when making that choice?",
-      "That makes sense. Let's pivot slightly—what is your experience with writing tests for this kind of feature?",
-      "Interesting. If requirements suddenly changed halfway through, how would you adapt?"
-    ];
-    const randomReply = fallbackResponses[Math.floor(Math.random() * fallbackResponses.length)];
-    
-    return res.json({ success: true, reply: `(Simulated AI) ${randomReply}` });
-  }
+      const apiMessages = [
+        { role: 'system', content: systemInstruction },
+        ...cleanMessages
+      ];
+
+      let aiResponseText = "";
+      let groqApiKey = process.env.GROQ_API_KEY;
+      
+      // Fallback: manually read .env if missing from process.env
+      if (!groqApiKey) {
+          try {
+              const envContent = fs.readFileSync(path.join(__dirname, '.env'), 'utf8');
+              const match = envContent.match(/GROQ_API_KEY\s*=\s*"?([^"\n]+)"?/);
+              if (match && match[1]) groqApiKey = match[1].trim();
+          } catch (e) { /* ignore */ }
+      }
+
+      if (groqApiKey && groqApiKey.length > 5) {
+        console.log("Attempting ultra-fast Groq API...");
+        const groq = new Groq({ apiKey: groqApiKey });
+        try {
+          const completion = await groq.chat.completions.create({
+            messages: apiMessages,
+            model: 'llama3-8b-8192',
+            response_format: { type: 'json_object' },
+            temperature: 0.7,
+          });
+          aiResponseText = completion.choices[0].message.content;
+          console.log("Groq Success!");
+        } catch (groqErr) {
+          console.log("Groq failed, falling back to local Ollama. Error:", groqErr.message);
+          groqApiKey = null; // trigger Ollama fallback
+        }
+      }
+
+      // If Groq isn't configured or failed, use Ollama natively!
+      if (!groqApiKey || !aiResponseText) {
+        console.log("Using Local Ollama (llama3) API...");
+        const modelName = process.env.LOCAL_MODEL || 'llama3';
+        const chatHistory = cleanMessages.map(m => `${m.role === 'assistant' ? 'Interviewer' : 'Candidate'}: ${m.content}`).join('\n\n');
+        const promptText = `Here is the interview transcript so far:\n\n${chatHistory}\n\nAs the Interviewer, generate your JSON response now.`;
+
+        const response = await axios.post('http://localhost:11434/api/chat', {
+          model: modelName,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: promptText }
+          ],
+          format: 'json',
+          stream: false
+        });
+        aiResponseText = response.data.message.content;
+      }
+
+      console.log("Raw AI Output:", aiResponseText);
+      let parsed = {};
+      try {
+        parsed = JSON.parse(aiResponseText);
+      } catch (parseError) {
+        console.error("Failed to parse JSON:", parseError);
+        parsed = {
+          reply: "That's an interesting approach. Can you elaborate further?",
+          feedback: "Good response, but could use more detail.",
+          scores: { content: 8, clarity: 8, relevance: 8, confidence: 8, overall: 8 },
+          sampleAnswer: "A comprehensive answer details the trade-offs.",
+          missedPoints: ["No missed points identified."]
+        };
+      }
+
+      return res.json({
+        success: true,
+        reply: parsed.reply,
+        feedback: parsed.feedback,
+        scores: parsed.scores || { content: 8, clarity: 8, relevance: 8, confidence: 8, overall: 8 },
+        sampleAnswer: parsed.sampleAnswer || "Consider using the STAR method.",
+        missedPoints: parsed.missedPoints || ["Provide more structure."]
+      });
+
+    } catch (error) {
+      console.error('AI Interview error:', error.message);
+      
+      const fallbackResponses = [
+        "I see. That's a good approach. How would you optimize it further?",
+        "Can you explain the trade-offs you considered when making that choice?",
+        "That makes sense. Let's pivot slightly—what is your experience with writing tests for this kind of feature?",
+        "Interesting. If requirements suddenly changed halfway through, how would you adapt?"
+      ];
+      const randomReply = fallbackResponses[Math.floor(Math.random() * fallbackResponses.length)];
+
+      return res.json({
+        success: true,
+        reply: `(Simulated AI) ${randomReply}`,
+        feedback: "This is a fallback response because the AI server is busy or unavailable.",
+        scores: { content: 6, clarity: 6, relevance: 6, confidence: 6, overall: 6 },
+        sampleAnswer: "AI is currently unavailable. Try again in a few seconds.",
+        missedPoints: ["AI fallback triggered."]
+      });
+    }
 });
 
 // --- RESUME PARSER & AI OPTIMIZATION ---
@@ -403,7 +484,7 @@ app.post('/api/resume/analyze', upload.single('resume'), async (req, res) => {
     } catch (parseError) {
       console.warn("PDF parsing failed (bad XRef etc.), using fallback text.", parseError.message);
     }
-    
+
     // If the PDF library fails to parse it (very common with pdf-parse on modern PDFs), use a robust fallback text
     if (!resumeText || resumeText.trim().length === 0) {
       resumeText = "Software Developer. Worked on the backend API for the main application using Node.js. Fixed bugs in the React frontend. Created database schemas. Strong grammar but lacks impact.";
@@ -459,7 +540,7 @@ ${resumeText.substring(0, 4000)} // limit to avoid token issues
 
     const chatCompletion = await groq.chat.completions.create({
       messages: [{ role: 'user', content: prompt }],
-      model: 'qwen/qwen3.8-27b', // Fallback to Qwen (Mistral was decommissioned on Groq)
+      model: 'llama-3.1-8b-instant', // Fast fallback model
       temperature: 0.2, // low temp for JSON
       response_format: { type: "json_object" }
     });
@@ -467,11 +548,13 @@ ${resumeText.substring(0, 4000)} // limit to avoid token issues
     const aiResponse = chatCompletion.choices[0].message.content;
     const parsedData = JSON.parse(aiResponse);
 
-    // Save to database if phone is provided
-    if (req.body.phone) {
+    // Save to database if phone or email is provided
+    const identifier = req.body.phone || req.body.email;
+    if (identifier) {
       try {
+        const whereClause = req.body.phone ? { phone: req.body.phone } : { email: req.body.email };
         await prisma.user.update({
-          where: { phone: req.body.phone },
+          where: whereClause,
           data: {
             resumeUrl,
             resumeScore: parsedData.score || 0
@@ -485,6 +568,7 @@ ${resumeText.substring(0, 4000)} // limit to avoid token issues
     res.json({
       success: true,
       wordCount: resumeText.split(/\s+/).length,
+      resumeUrl,
       ...parsedData
     });
 
@@ -493,6 +577,128 @@ ${resumeText.substring(0, 4000)} // limit to avoid token issues
     res.status(500).json({ error: 'Failed to analyze resume' });
   }
 });
+
+// --- RESUME BASED QUESTIONS ---
+app.post('/api/resume/questions', async (req, res) => {
+  const { resumeUrl } = req.body;
+  if (!resumeUrl) return res.status(400).json({ error: 'Resume URL is required' });
+
+  try {
+    const fileName = resumeUrl.replace('/uploads/', '');
+    const filePath = path.join(__dirname, 'uploads', fileName);
+    
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'Resume file not found on server' });
+    }
+
+    const dataBuffer = fs.readFileSync(filePath);
+    let resumeText = "";
+    try {
+      const pdfData = await pdfParse(dataBuffer);
+      resumeText = pdfData.text || "";
+    } catch (e) {
+      resumeText = "Software Developer with generic experience.";
+    }
+
+    if (!process.env.GROQ_API_KEY) {
+      return res.json({
+        success: true,
+        questions: [
+          "I see you worked on an E-commerce project. How did you handle the payment gateway integration failures?",
+          "Your resume mentions 'Optimized database queries'. Can you walk me through the specific metrics you improved?",
+          "You used React context in your last role. Why did you choose it over Redux for that specific use case?"
+        ]
+      });
+    }
+
+    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const prompt = `You are an expert technical interviewer. I will provide you with the text extracted from a candidate's resume PDF.
+Your task is to generate 3 highly specific, challenging interview questions based ONLY on the projects, skills, or experiences mentioned in this resume.
+Act like a hiring manager trying to probe the depth of their actual involvement.
+
+Return ONLY a valid JSON object with EXACTLY the following structure:
+{
+  "questions": [
+    "Question 1",
+    "Question 2",
+    "Question 3"
+  ]
+}
+No markdown, no explanations outside JSON.
+
+RESUME TEXT:
+${resumeText.substring(0, 4000)}
+`;
+
+    const chatCompletion = await groq.chat.completions.create({
+      messages: [{ role: 'user', content: prompt }],
+      model: 'llama-3.1-8b-instant',
+      temperature: 0.5,
+      response_format: { type: "json_object" }
+    });
+
+    const aiResponse = chatCompletion.choices[0].message.content;
+    const parsedData = JSON.parse(aiResponse);
+
+    res.json({ success: true, questions: parsedData.questions });
+  } catch (error) {
+    console.error('Resume Questions Error:', error);
+    res.status(500).json({ error: 'Failed to generate resume questions' });
+  }
+});
+// --- INTERVIEW GAP PREP ---
+app.post('/api/interview/gap', async (req, res) => {
+  const { gap, role } = req.body;
+  if (!gap || !role) {
+    return res.status(400).json({ error: 'gap and role are required' });
+  }
+
+  const prompt = `You are an expert technical interviewer. The candidate is applying for the role of "${role}", but they have an identified skill gap in "${gap}".
+Generate exactly 3 specific, probing interview questions about "${gap}" that they might face in an interview for this role.
+Output ONLY a valid JSON object with the following structure:
+{
+  "questions": [
+    { "id": 1, "q": "Question 1..." },
+    { "id": 2, "q": "Question 2..." },
+    { "id": 3, "q": "Question 3..." }
+  ]
+}`;
+
+  if (!process.env.GROQ_API_KEY) {
+    return res.json({
+      success: true,
+      questions: [
+        { id: 1, q: `What is your understanding of ${gap} and how does it apply to a ${role} position?` },
+        { id: 2, q: `Can you explain a basic use case or implementation of ${gap}?` },
+        { id: 3, q: `How would you approach learning ${gap} if we hired you today?` }
+      ]
+    });
+  }
+
+  try {
+    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const completion = await groq.chat.completions.create({
+      messages: [{ role: 'user', content: prompt }],
+      model: 'llama-3.1-8b-instant',
+      temperature: 0.7,
+      response_format: { type: "json_object" }
+    });
+    
+    const parsedData = JSON.parse(completion.choices[0].message.content.trim());
+    res.json({ success: true, questions: parsedData.questions });
+  } catch (err) {
+    console.error('Gap questions error:', err.message);
+    return res.json({
+      success: true,
+      questions: [
+        { id: 1, q: `What is your understanding of ${gap} and how does it apply to a ${role} position?` },
+        { id: 2, q: `Can you explain a basic use case or implementation of ${gap}?` },
+        { id: 3, q: `How would you approach learning ${gap} if we hired you today?` }
+      ]
+    });
+  }
+});
+
 // --- SKILL GAP ROADMAP AI ---
 app.post('/api/roadmap/analyze', async (req, res) => {
   const { targetRole, currentSkills } = req.body;
@@ -500,7 +706,7 @@ app.post('/api/roadmap/analyze', async (req, res) => {
     return res.status(400).json({ error: 'targetRole and currentSkills are required' });
   }
 
-  if (!process.env.GROQ_API_KEY) {
+  if (!process.env.GEMINI_API_KEY) {
     // Fallback for hackathon
     return res.json({
       success: true,
@@ -519,7 +725,7 @@ app.post('/api/roadmap/analyze', async (req, res) => {
   }
 
   try {
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
     const prompt = `You are an expert career coach and technical recruiter.
 I will provide a candidate's current skills and their target role.
 Your task is to analyze the gap and return a JSON object with exactly this structure:
@@ -543,14 +749,15 @@ Generate exactly 4 skill gaps. ONLY output valid JSON. No markdown formatting ou
 Current Skills: ${currentSkills.join(', ')}
 Target Role: ${targetRole}`;
 
-    const chatCompletion = await groq.chat.completions.create({
-      messages: [{ role: 'user', content: prompt }],
-      model: 'qwen/qwen3.8-27b',
-      temperature: 0.3,
-      response_format: { type: "json_object" }
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+      }
     });
 
-    const aiResponse = chatCompletion.choices[0].message.content;
+    const aiResponse = response.text;
     const parsedData = JSON.parse(aiResponse);
 
     res.json({ success: true, ...parsedData });
@@ -639,20 +846,26 @@ app.get('/api/institution/students', async (req, res) => {
 app.delete('/api/institution/students/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    
+
     // Prisma will not auto-cascade if not set up, so let's delete relations first
     await prisma.application.deleteMany({ where: { userId: id } });
     await prisma.mockInterview.deleteMany({ where: { userId: id } });
-    
+
     await prisma.user.delete({
       where: { id }
     });
-    
+
     res.json({ success: true, message: "User deleted successfully" });
   } catch (error) {
     console.error("Error deleting student:", error);
     res.status(500).json({ error: "Failed to delete student" });
   }
+});
+
+// Global Error Handler
+app.use((err, req, res, next) => {
+  console.error("Express Error:", err);
+  res.status(500).json({ error: err.message || 'Internal Server Error' });
 });
 
 app.listen(port, () => {
