@@ -342,7 +342,8 @@ Skills: ${userProfile?.skillsList}
 
 CRITICAL RULES:
 1. Act as the interviewer. Evaluate their answer briefly, then ask the NEXT technical question.
-2. You MUST output ONLY a valid JSON object.
+2. IMPORTANT: If the candidate ASKS YOU A QUESTION (e.g., asking for a hint, asking you to explain the answer, or saying they don't know), you MUST directly answer their question and explain the concept clearly in the "reply" field BEFORE moving on to a new question.
+3. You MUST output ONLY a valid JSON object.
 
 JSON FORMAT:
 {
